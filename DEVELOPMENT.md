@@ -2,7 +2,10 @@
 
 This directory is independent of the RefmatDB server project. Open it as its own
 Codex project or RStudio project for future client work. No server deployment is
-required to develop this client. No Git remote or published package exists yet.
+required to develop this client. Source is hosted at
+https://github.com/MLKaufman/refmatR (currently private). The package can be
+installed with `remotes::install_github("MLKaufman/refmatR")` by users with
+repository access; see README.md for authentication and dependency setup.
 
 Server source: ../RefmatDB/src/refmatdb/api.py
 Public server: https://refmatdb.seq-space.com

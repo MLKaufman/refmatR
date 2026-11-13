@@ -1,6 +1,24 @@
 # End-to-end RefmatDB / clustifyr / Seurat workflow
 
-Run from this directory:
+## Get the workflow from GitHub
+
+The QMD and renv files live in the source repository and are excluded from the
+installed R package. Clone the repository using an authenticated Git client
+(the repository is currently private and requires access):
+
+```sh
+git clone https://github.com/MLKaufman/refmatR.git
+cd refmatR/qmd-tests
+```
+
+Place your own Seurat object at `qmd-tests/so.rds` before rendering; the input
+RDS, downloaded references, generated report, and outputs are not committed.
+Review `workflow.qmd` parameters for your species, tissue, reference UUID,
+cluster column, and existing-label column. The current defaults describe the
+mouse mammary integration test, not arbitrary scRNA-seq data.
+
+Install Quarto separately and use R compatible with the lockfile (this run used
+R 4.6.1 and Bioconductor 3.23). From this directory:
 
 ```sh
 Rscript setup.R
@@ -51,7 +69,7 @@ existing-label comparison is descriptive and does not constitute ground truth.
 The original and generated datasets, HTML output, downloads, renv library, and
 render intermediates are ignored by Git. The entire qmd-tests directory is
 excluded from refmatR package builds. Keep the QMD, setup script, lockfile,
-and renv activation files under version control when you initialize a repo.
+and renv activation files under version control in the repository.
 
 See `quarto-version.txt` for the Quarto version used in this run.
 

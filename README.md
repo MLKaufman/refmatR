@@ -2,17 +2,42 @@
 
 An R client for [RefmatDB](https://refmatdb.seq-space.com). Search public or
 accessible private references, inspect metadata, and retrieve a numeric
-**genes × cell types** matrix for clustifyr. Version 0.1.0 is a read-only client;
+**genes × cell types** matrix for clustifyr.  
+
+Version 0.1.0 is a read-only client;
 it does not upload, change accounts, or send your query scRNA-seq data anywhere.
 
-## Install locally
+## Install from GitHub
+
+Requires R 4.1 or newer. Install the current development version directly from
+[MLKaufman/refmatR](https://github.com/MLKaufman/refmatR):
 
 ```r
-install.packages(c("httr2", "digest"))
-install.packages("/Users/mkaufman/BBSR_Projects/Kaufman/refmatR",
-                 repos = NULL, type = "source")
+install.packages("remotes")
+remotes::install_github("MLKaufman/refmatR")
 library(refmatR)
+
+# Public RefmatDB access needs no RefmatDB account or API token.
+db <- refmatdb(token = "")
+refmat_search(db, limit = 5)
 ```
+
+### Optional annotation packages
+
+Searching and downloading references only requires refmatR. To compare your
+own data with clustifyr and work with Seurat objects:
+
+```r
+if (!requireNamespace("BiocManager", quietly = TRUE)) {
+  install.packages("BiocManager")
+}
+BiocManager::install("clustifyr", update = FALSE, ask = FALSE)
+install.packages("Seurat")
+```
+
+Use the Bioconductor release appropriate to your R version. The fully executed
+example in [qmd-tests](qmd-tests/README.md) includes an isolated renv environment,
+Quarto report, annotation comparisons, and reproducible setup instructions.
 
 ## Find and retrieve a reference
 
@@ -52,7 +77,7 @@ with `cell_type` in this API version.
 
 ## Compare your dataset with clustifyr
 
-Install clustifyr separately with `BiocManager::install("clustifyr")`.
+Install clustifyr using the optional annotation package instructions above.
 The query matrix and metadata stay in your R session. Start with a suitable
 reference for the query species, tissue, and gene identifier convention.
 
