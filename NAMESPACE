@@ -1,0 +1,8 @@
+export(refmatdb)
+export(refmat_search)
+export(refmat_celltypes)
+export(refmat_info)
+export(refmat_download)
+export(refmat_read)
+export(refmat_get)
+S3method(print,refmatdb_client)

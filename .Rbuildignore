@@ -1,0 +1,7 @@
+^\.git$
+^\.gitignore$
+^DEVELOPMENT\.md$
+
+^qmd-tests$
+^refmatR\.Rproj$
+^\.DS_Store$

@@ -1,0 +1,12 @@
+Package: refmatR
+Title: Search and Retrieve Reference Matrices from RefmatDB
+Version: 0.1.0
+Authors@R: person("Michael", "Kaufman", role = c("aut", "cre"), email = "mkaufman@users.noreply.github.com")
+Description: A read-only client for RefmatDB. Searches reference metadata and
+    cell types, downloads original files with SHA-256 verification, and imports
+    numeric genes-by-cell-type matrices for downstream annotation with clustifyr.
+License: MIT + file LICENSE
+Encoding: UTF-8
+Depends: R (>= 4.1.0)
+Imports: httr2 (>= 1.0.0), digest, utils
+Suggests: clustifyr

@@ -1,0 +1,431 @@
+---
+title: "RefmatDB to clustifyr: Seurat annotation workflow"
+subtitle: "End-to-end integration test using the supplied so.rds"
+format:
+  html:
+    toc: true
+    embed-resources: true
+    code-fold: true
+    code-tools: true
+execute:
+  echo: true
+  warning: true
+  message: false
+  cache: false
+params:
+  input_file: "so.rds"
+  server: "https://refmatdb.seq-space.com"
+  species: "mouse"
+  tissue: "mammary"
+  reference_id: "36ca870e-74c0-4cb2-b070-606c3067f0e0"
+  cluster_col: "seurat_clusters"
+  existing_label_col: "celltypes"
+  assay: "RNA"
+  n_variable_genes: 2000
+  min_shared_genes: 100
+  correlation_threshold: 0.3
+  review_score_threshold: 0.7
+  review_margin_threshold: 0.05
+---
+
+## Purpose and interpretation
+
+This workflow tests the complete path from a RefmatDB metadata search to a
+checksum-verified reference download, clustifyr scoring, and annotations saved
+on a Seurat object. All query expression data remain local. The original
+`so.rds` is read only; the annotated object is written to `outputs/`.
+
+**This is an integration test, not an independent annotation benchmark.** The
+available reference is mouse mammary tissue, and the supplied object has mouse
+gene symbols and mammary cell labels. Its provenance may overlap the reference
+dataset. Agreement with the existing annotations therefore does not establish
+accuracy on unseen data. Correlation scores are not probabilities, and the
+0.3 cutoff is an illustrative, configurable threshold, not a calibrated one.
+
+## Environment
+
+Run `Rscript setup.R` once, then `quarto render workflow.qmd` from this folder.
+Subsequent setups restore `renv.lock`. Dependencies are installed by setup,
+never implicitly while rendering. The full session information is included at
+the end and saved with the results.
+
+```{r}
+#| label: setup
+library(refmatR)
+library(Seurat)
+library(clustifyr)
+library(ggplot2)
+library(jsonlite)
+library(digest)
+library(knitr)
+set.seed(42)
+dir.create("outputs", showWarnings = FALSE)
+dir.create("data", showWarnings = FALSE)
+stopifnot(file.exists(params$input_file))
+input_hash <- digest::digest(file = params$input_file, algo = "sha256")
+package_versions <- data.frame(
+  package = c("refmatR", "Seurat", "SeuratObject", "clustifyr", "renv"),
+  version = vapply(c("refmatR", "Seurat", "SeuratObject", "clustifyr", "renv"),
+                   function(p) as.character(packageVersion(p)), character(1))
+)
+kable(package_versions)
+```
+
+## Search RefmatDB and select a reference
+
+The reference UUID is explicitly pinned in the parameters. Searching by species
+and tissue verifies that it is still an appropriate catalog candidate; the
+workflow does not silently choose the first result if that reference disappears.
+Public access is used for this run. For a private reference, change the client
+to `refmatdb(params$server)` and set `REFMATDB_TOKEN` privately in your environment.
+
+```{r}
+#| label: search
+client <- refmatdb(params$server, token = "")
+hits <- refmat_search(client, species = params$species, tissue = params$tissue,
+                      all = TRUE)
+stopifnot(nrow(hits) > 0, params$reference_id %in% hits$id)
+kable(hits[, c("id", "name", "species", "tissue", "n_genes", "n_celltypes")])
+info <- refmat_info(params$reference_id, client)
+stopifnot(info$species == params$species, info$gene_id_type == "symbol")
+kable(data.frame(field = c("source", "value_type", "sha256"),
+                 value = c(info$source, info$value_type, info$sha256)))
+celltypes <- refmat_celltypes(client, species = params$species,
+                              tissue = params$tissue, all = TRUE)
+kable(celltypes)
+```
+
+## Download and inspect the reference
+
+The original file is saved with SHA-256 validation. Parsing handles CSV, TSV,
+and gzip by content and returns genes in rows and cell types in columns.
+No reference expression transformation or identifier conversion is performed.
+The file extension here is only a local name; the original filename is recorded
+in `reference-metadata.json`.
+
+```{r}
+#| label: reference
+reference_path <- file.path("data", paste0(params$reference_id, ".refmat"))
+refmat_download(params$reference_id, reference_path, client, overwrite = TRUE)
+reference <- refmat_read(reference_path)
+stopifnot(is.numeric(reference), all(is.finite(reference)),
+          nrow(reference) == info$n_genes, ncol(reference) == info$n_celltypes)
+jsonlite::write_json(info, "outputs/reference-metadata.json", pretty = TRUE,
+                     auto_unbox = TRUE, null = "null")
+kable(data.frame(cell_type = colnames(reference)))
+```
+
+## Load and prepare the Seurat object
+
+The existing clusters are retained. RNA counts are normalized explicitly with
+Seurat's LogNormalize method (scale factor 10,000), giving natural-log1p input
+for `if_log = TRUE` in clustifyr. The workflow does not use scaled residuals or
+integrated expression. Existing UMAP coordinates and original annotations are
+preserved. No cells are subsampled.
+
+```{r}
+#| label: query
+so <- readRDS(params$input_file)
+stopifnot(inherits(so, "Seurat"), params$assay %in% Assays(so))
+DefaultAssay(so) <- params$assay
+if (inherits(so[[params$assay]], "Assay5") &&
+    any(grepl("^counts\\.", Layers(so[[params$assay]])))) {
+  so <- JoinLayers(so, assay = params$assay)
+}
+stopifnot("counts" %in% Layers(so[[params$assay]]))
+metadata <- so[[]]
+stopifnot(params$cluster_col %in% names(metadata),
+          !anyNA(metadata[[params$cluster_col]]),
+          !anyDuplicated(colnames(so)), !anyDuplicated(rownames(so)))
+metadata <- metadata[colnames(so), , drop = FALSE]
+so <- NormalizeData(so, assay = params$assay, normalization.method = "LogNormalize",
+                    scale.factor = 10000, verbose = FALSE)
+so <- FindVariableFeatures(so, assay = params$assay, selection.method = "vst",
+                           nfeatures = params$n_variable_genes, verbose = FALSE)
+query <- LayerData(so, assay = params$assay, layer = "data")
+shared <- intersect(rownames(query), rownames(reference))
+query_genes <- intersect(VariableFeatures(so), shared)
+stopifnot(length(query_genes) >= params$min_shared_genes)
+# Only the selected genes are passed to clustifyr to bound memory use.
+query <- query[query_genes, colnames(so), drop = FALSE]
+stopifnot(identical(colnames(query), rownames(metadata)))
+summary_table <- data.frame(
+  metric = c("Cells", "Clusters", "Query genes", "Reference genes",
+             "Shared genes", "Shared variable genes used"),
+  value = c(ncol(so), length(unique(metadata[[params$cluster_col]])), nrow(so),
+            nrow(reference), length(shared), length(query_genes))
+)
+kable(summary_table)
+write.csv(summary_table, "outputs/input-summary.csv", row.names = FALSE)
+writeLines(query_genes, "outputs/query-genes.txt")
+```
+
+## Score clusters and assign candidate labels
+
+Spearman correlations compare cluster expression profiles with each reference
+cell type. The best-minus-second-best score is reported as an ambiguity
+indicator, not as a statistical confidence interval. Low-scoring clusters
+remain unassigned using the configured cutoff.
+
+```{r}
+#| label: annotate
+scores <- clustifyr::clustify(
+  input = query, ref_mat = reference, metadata = metadata,
+  cluster_col = params$cluster_col, query_genes = query_genes,
+  if_log = TRUE, compute_method = "spearman", verbose = FALSE
+)
+stopifnot(is.matrix(scores), all(is.finite(scores)),
+          nrow(scores) == length(unique(metadata[[params$cluster_col]])),
+          setequal(colnames(scores), colnames(reference)))
+calls <- as.data.frame(clustifyr::cor_to_call(
+  scores, threshold = params$correlation_threshold))
+calls$cluster <- as.character(calls$cluster)
+stopifnot(!anyDuplicated(calls$cluster))
+ranked <- t(apply(scores, 1, sort, decreasing = TRUE))
+margins <- ranked[, 1] - ranked[, 2]
+calls$margin <- unname(margins[calls$cluster])
+calls$n_cells <- as.integer(table(as.character(metadata[[params$cluster_col]]))[calls$cluster])
+index <- match(as.character(metadata[[params$cluster_col]]), calls$cluster)
+stopifnot(!anyNA(index))
+so$refmatR_type <- as.character(calls$type[index])
+so$refmatR_score <- as.numeric(calls$r[index])
+so$refmatR_margin <- calls$margin[index]
+so$refmatR_reference_id <- params$reference_id
+so$refmatR_reference_sha256 <- info$sha256
+write.csv(scores, "outputs/cluster-correlations.csv")
+write.csv(calls, "outputs/cluster-calls.csv", row.names = FALSE)
+kable(calls, digits = 3)
+```
+
+### Correlation heatmap
+
+```{r}
+#| label: heatmap
+#| fig-width: 12
+#| fig-height: 9
+long <- as.data.frame(as.table(scores), stringsAsFactors = FALSE)
+names(long) <- c("cluster", "reference_type", "correlation")
+ggplot(long, aes(reference_type, cluster, fill = correlation)) +
+  geom_tile() + scale_fill_viridis_c() + theme_minimal() +
+  theme(axis.text.x = element_text(angle = 55, hjust = 1)) +
+  labs(x = "Reference cell type", y = "Query cluster", fill = "Spearman r")
+```
+
+## Compare original and clustifyr annotations
+
+Both UMAP panels use exactly the same cells, coordinates, axes, and color map.
+Labels are compared literally; no synonyms or related cell types are silently
+merged. These are agreement diagnostics, not accuracy estimates against an
+independent ground truth.
+
+```{r}
+#| label: comparison-data
+stopifnot(params$existing_label_col %in% colnames(metadata),
+          params$review_score_threshold >= -1, params$review_score_threshold <= 1,
+          params$review_margin_threshold >= 0)
+original <- as.character(metadata[[params$existing_label_col]])
+predicted <- as.character(so$refmatR_type)
+known_original <- !is.na(original) & nzchar(trimws(original))
+original[!known_original] <- "[Missing original label]"
+predicted[is.na(predicted) | !nzchar(trimws(predicted))] <- "[Unassigned]"
+label_levels <- sort(unique(c(original, predicted)))
+palette <- setNames(grDevices::hcl.colors(length(label_levels), "Dark 3"), label_levels)
+if ("[Missing original label]" %in% label_levels) palette["[Missing original label]"] <- "grey65"
+if ("[Unassigned]" %in% label_levels) palette["[Unassigned]"] <- "grey35"
+```
+
+### Side-by-side UMAPs
+
+```{r}
+#| label: umap-comparison
+#| fig-width: 14
+#| fig-height: 8
+if ("umap" %in% Reductions(so)) {
+  embedding <- Embeddings(so, reduction = "umap")[rownames(metadata), 1:2, drop = FALSE]
+  stopifnot(identical(rownames(embedding), rownames(metadata)))
+  plot_data <- rbind(
+    data.frame(UMAP_1 = embedding[, 1], UMAP_2 = embedding[, 2],
+               label = original, annotation = "Original celltypes"),
+    data.frame(UMAP_1 = embedding[, 1], UMAP_2 = embedding[, 2],
+               label = predicted, annotation = "clustifyr candidates"))
+  plot_data$annotation <- factor(plot_data$annotation,
+                                levels = c("Original celltypes", "clustifyr candidates"))
+  plot_data$label <- factor(plot_data$label, levels = label_levels)
+  umap_comparison <- ggplot(plot_data, aes(UMAP_1, UMAP_2, color = label)) +
+    geom_point(size = 0.35, alpha = 0.8) + coord_equal() +
+    facet_wrap(~annotation, nrow = 1) +
+    scale_color_manual(values = palette, drop = FALSE) + theme_minimal(base_size = 11) +
+    theme(legend.position = "bottom", panel.grid = element_blank()) +
+    guides(color = guide_legend(ncol = 3, override.aes = list(size = 3, alpha = 1))) +
+    labs(color = "Cell type", title = "Original and clustifyr annotations on the same UMAP")
+  print(umap_comparison)
+  ggsave("outputs/umap-comparison.png", umap_comparison, width = 14, height = 8, dpi = 180)
+} else {
+  cat("No existing UMAP is present; no new embedding was calculated.")
+}
+```
+
+### Confusion matrix: original versus predicted labels
+
+Rows are original labels; columns are clustifyr labels. Tile color shows the
+percentage within each original-label row, and the text gives the cell count.
+Missing original labels remain visible but are excluded from agreement rates.
+
+```{r}
+#| label: confusion-matrix
+#| fig-width: 12
+#| fig-height: 10
+agreement <- table(original = factor(original, levels = label_levels),
+                   predicted = factor(predicted, levels = label_levels))
+stopifnot(sum(agreement) == ncol(so))
+row_percent <- sweep(agreement, 1, pmax(rowSums(agreement), 1), "/") * 100
+write.csv(as.data.frame.matrix(agreement), "outputs/existing-label-comparison.csv")
+write.csv(as.data.frame.matrix(agreement), "outputs/confusion-counts.csv")
+write.csv(as.data.frame.matrix(row_percent), "outputs/confusion-row-percent.csv")
+confusion_data <- as.data.frame(agreement)
+confusion_data$row_percent <- as.vector(row_percent)
+confusion_data$original <- factor(confusion_data$original, levels = rev(label_levels))
+confusion_plot <- ggplot(confusion_data, aes(predicted, original, fill = row_percent)) +
+  geom_tile(color = "white", linewidth = 0.2) +
+  geom_text(aes(label = ifelse(Freq > 0, Freq, ""),
+                color = row_percent > 50), size = 2.8, show.legend = FALSE) +
+  scale_color_manual(values = c("FALSE" = "#173b4b", "TRUE" = "white")) +
+  scale_fill_gradient(low = "#f2f7fa", high = "#164d70", limits = c(0, 100)) +
+  coord_equal() + theme_minimal(base_size = 10) +
+  theme(axis.text.x = element_text(angle = 50, hjust = 1), panel.grid = element_blank()) +
+  labs(x = "clustifyr label", y = "Original label", fill = "% within\noriginal label",
+       title = "Label agreement by cell", subtitle = "Numbers are cell counts; color is row percentage")
+print(confusion_plot)
+ggsave("outputs/confusion-matrix.png", confusion_plot, width = 12, height = 10, dpi = 180)
+```
+
+### Clusters to review
+
+A cluster is flagged if **any cell with an existing label disagrees** with its
+clustifyr call, if its top correlation is below
+`r params$review_score_threshold`, or if its top-minus-runner-up margin is below
+`r params$review_margin_threshold`. Missing original labels and tied original
+majorities are also flagged. The review score threshold is separate from the
+`r params$correlation_threshold` cutoff used to assign calls. These configurable
+heuristics identify candidates for inspection; they are not calibrated confidence
+probabilities. Mixed original labels can produce disagreement even when the
+majority label matches.
+
+```{r}
+#| label: cluster-review
+cluster_ids <- as.character(metadata[[params$cluster_col]])
+cluster_review <- do.call(rbind, lapply(seq_len(nrow(calls)), function(i) {
+  cluster <- calls$cluster[i]
+  members <- which(cluster_ids == cluster)
+  known <- members[known_original[members]]
+  tally <- sort(table(original[known]), decreasing = TRUE)
+  majorities <- if (length(tally)) names(tally)[tally == max(tally)] else character()
+  score_order <- order(scores[cluster, ], decreasing = TRUE)
+  top_score <- scores[cluster, score_order[1]]
+  runner_up <- colnames(scores)[score_order[2]]
+  runner_score <- scores[cluster, score_order[2]]
+  n_disagree <- sum(original[known] != predicted[known])
+  low_score <- top_score < params$review_score_threshold
+  small_margin <- top_score - runner_score < params$review_margin_threshold
+  flags <- c(if (n_disagree > 0) "Label disagreement",
+             if (low_score) "Low correlation",
+             if (small_margin) "Small margin",
+             if (length(known) < length(members)) "Missing original labels",
+             if (length(majorities) > 1) "Tied original majority")
+  data.frame(cluster = cluster, n_cells = length(members), n_known_original = length(known),
+    original_majority = if (length(majorities)) paste(majorities, collapse = " / ") else NA_character_,
+    majority_pct = if (length(tally)) 100 * max(tally) / length(known) else NA_real_,
+    predicted = predicted[members[1]],
+    agreement_pct = if (length(known)) 100 * (length(known) - n_disagree) / length(known) else NA_real_,
+    n_disagree = n_disagree, top_score = unname(top_score), runner_up = runner_up,
+    runner_up_score = unname(runner_score), margin = unname(top_score - runner_score),
+    low_score = low_score, small_margin = small_margin, flagged = length(flags) > 0,
+    reasons = if (length(flags)) paste(flags, collapse = "; ") else "No flags")
+}))
+cluster_review <- cluster_review[order(!cluster_review$flagged,
+  -cluster_review$n_disagree, cluster_review$margin), ]
+stopifnot(sum(cluster_review$n_cells) == ncol(so),
+          sum(cluster_review$n_disagree) == sum(original[known_original] != predicted[known_original]),
+          all(abs(cluster_review$margin - margins[cluster_review$cluster]) < 1e-10))
+write.csv(cluster_review, "outputs/cluster-review.csv", row.names = FALSE)
+write.csv(cluster_review[cluster_review$flagged, ], "outputs/flagged-clusters.csv", row.names = FALSE)
+review_summary <- data.frame(
+  metric = c("Clusters reviewed", "Flagged clusters", "Clusters with label disagreement",
+             "Low-correlation clusters", "Small-margin clusters", "Cells with known original labels",
+             "Cells agreeing with original label", "Cells disagreeing with original label"),
+  value = c(nrow(cluster_review), sum(cluster_review$flagged), sum(cluster_review$n_disagree > 0),
+            sum(cluster_review$low_score), sum(cluster_review$small_margin), sum(known_original),
+            sum(original[known_original] == predicted[known_original]), sum(cluster_review$n_disagree)))
+kable(review_summary)
+write.csv(review_summary, "outputs/review-summary.csv", row.names = FALSE)
+```
+
+Flagged rows are shaded and list the reason for review. Agreement and majority
+percentages use only cells with a known original label. The full-precision CSV
+also includes runner-up scores, missing-label denominators, and individual flags.
+
+```{r}
+#| label: review-table
+#| results: asis
+view <- data.frame(
+  Cluster = cluster_review$cluster, Cells = cluster_review$n_cells,
+  `Original majority (%)` = paste0(cluster_review$original_majority, " (",
+                                    round(cluster_review$majority_pct, 1), ")"),
+  Predicted = cluster_review$predicted,
+  `Agreement (%)` = round(cluster_review$agreement_pct, 1),
+  `Best r` = round(cluster_review$top_score, 3),
+  `Runner-up` = cluster_review$runner_up, Margin = round(cluster_review$margin, 3),
+  Review = cluster_review$reasons, check.names = FALSE)
+escape <- function(x) {
+  x <- gsub("&", "&amp;", as.character(x), fixed = TRUE)
+  x <- gsub("<", "&lt;", x, fixed = TRUE)
+  gsub(">", "&gt;", x, fixed = TRUE)
+}
+cat('<div style="overflow-x:auto"><table class="table table-sm"><caption>Cluster review, flagged rows first</caption><thead><tr>')
+cat(paste0('<th scope="col">', escape(names(view)), '</th>', collapse = ''))
+cat('</tr></thead><tbody>')
+for (i in seq_len(nrow(view))) {
+  cat(if (cluster_review$flagged[i]) '<tr style="background-color:#fff2d9">' else '<tr>')
+  cat(paste0('<td>', escape(unlist(view[i, ], use.names = FALSE)), '</td>', collapse = ''))
+  cat('</tr>')
+}
+cat('</tbody></table></div>')
+```
+
+## Save results and verify the input was preserved
+
+```{r}
+#| label: save
+manifest <- list(
+  executed_at = format(Sys.time(), tz = "UTC", usetz = TRUE),
+  input_file = params$input_file, input_sha256 = input_hash,
+  reference_id = info$id, reference_sha256 = info$sha256,
+  server = params$server, parameters = params,
+  n_cells = ncol(so), n_clusters = nrow(scores), n_query_genes = length(query_genes),
+  packages = package_versions,
+  caveat = "Integration test; reference/query independence not established."
+)
+so@misc$refmatR <- manifest
+saveRDS(so, "outputs/so_refmatR_annotated.rds")
+jsonlite::write_json(manifest, "outputs/run-manifest.json", pretty = TRUE, auto_unbox = TRUE)
+stopifnot(identical(input_hash, digest::digest(file = params$input_file, algo = "sha256")))
+restored <- readRDS("outputs/so_refmatR_annotated.rds")
+stopifnot(identical(colnames(restored), colnames(so)),
+          identical(restored$refmatR_type, so$refmatR_type))
+cat("PASS: search, verified download, matrix import, cluster scoring, annotation, and saved-object reload.\n")
+cat("Original input SHA-256 is unchanged.\n")
+writeLines(capture.output(sessionInfo()), "outputs/session-info.txt")
+```
+
+## Session information
+
+```{r}
+#| label: session-info
+sessionInfo()
+```
+
+## References
+
+- [RefmatDB API](https://refmatdb.seq-space.com/api/docs)
+- [clustifyr scoring documentation](https://rnabioco.github.io/clustifyr/reference/clustify.html)
+- [clustifyr call conversion](https://rnabioco.github.io/clustifyr/reference/cor_to_call.html)
